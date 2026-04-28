@@ -6,6 +6,11 @@
 import logging
 import os
 import socket
+from typing_extensions import override
+from torch.distributed import GroupMember, ProcessGroup, ReduceOp, Work
+from typing import TypeVar, cast
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from megatron.core.utils import internal_api
 
@@ -19,10 +24,20 @@ except ImportError:
 
 try:
     from pplx_garden.kernels.p2p_all_to_all import P2PAllToAll
+    from pplx_garden.distributed.parallel_group import ParallelGroup
+    from pplx_garden.distributed.torch_group import TorchParallelGroup
+    from pplx_garden.distributed.nccl_all_reduce import NcclAllReduce
+    from pplx_garden.distributed.distributed_ops import Reducer
+    from pplx_garden.utils.torch import profile_range
 
     HAVE_PPLX_GARDEN = True
 except ImportError:
     P2PAllToAll = None
+    ParallelGroup = object
+    TorchParallelGroup = object
+    NcclAllReduce = None
+    profile_range = lambda name: (lambda x: x)  # no-op context manager
+    Reducer = object
     HAVE_PPLX_GARDEN = False
 
 import torch
@@ -31,6 +46,7 @@ _buffer = None
 _process_group_cache = {}
 _logger = logging.getLogger(__name__)
 
+T = TypeVar("T")
 
 def _pplx_debug_enabled() -> bool:
     return os.environ.get("MEGATRON_PPLX_DEBUG", "0") == "1"
@@ -45,73 +61,320 @@ def _pplx_debug_log(message: str) -> None:
 
 def _get_or_create_process_group(ranks, backend):
     key = (tuple(ranks), backend)
+    _pplx_debug_log(f"Requesting process group for ranks {ranks} and backend {backend}")
+    _pplx_debug_log(f"Current process group cache keys: {_process_group_cache.keys()}")
+    _pplx_debug_log(f"Our key is {key}")
     if key not in _process_group_cache:
+        _pplx_debug_log(f"Creating new process group for ranks {ranks} and backend {backend}")
         _process_group_cache[key] = torch.distributed.new_group(
             ranks=list(ranks), backend=backend
         )
+        _pplx_debug_log(f"Created process group with ranks {torch.distributed.get_process_group_ranks(_process_group_cache[key])} and backend {backend}")
+
     return _process_group_cache[key]
 
 
-class _TorchProcessGroupAdapter:
-    """A lightweight pplx-garden ParallelGroup adapter over a torch process group."""
+class _TorchProcessGroupAdapter(ParallelGroup):
+    """Wraps an existing Megatron device group as a pplx-garden TorchParallelGroup.
+
+    Unlike TorchParallelGroup, which always creates a new NCCL group, this adapter
+    accepts a pre-existing device_group (owned by Megatron) and only creates the
+    Gloo cmd_group needed for CPU-side collectives (broadcast_object, etc.).
+    is_inter_node is derived from actual node topology, not a size heuristic.
+    """
 
     def __init__(
         self,
         device_group: torch.distributed.ProcessGroup,
-        command_group: torch.distributed.ProcessGroup,
-        ranks,
-        node_meta,
+        ranks: list,
+        node_meta: dict,
     ):
-        self._device_group = device_group
-        self._command_group = command_group
-        self._ranks = list(ranks)
-        self._global_rank = torch.distributed.get_rank()
-        self._rank = self._ranks.index(self._global_rank)
-        self._size = len(self._ranks)
+        # Bypass TorchParallelGroup.__init__ — we must not create a new NCCL group.
+        # Manually set all attributes that TorchParallelGroup.__init__ would set.
         self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-        local_rank = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
-        self._local_rank = local_rank
+        self._local_rank = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
+        self._global_rank = torch.distributed.get_rank()
         self._node_rank = node_meta["node_rank"]
-        self._is_inter_node = node_meta["num_nodes"] > 1
+        self._is_inter_node = node_meta["num_nodes"] > 1 # TODO: maybe change this
+
+        self._ranks = list(ranks)
+        self._size = len(self._ranks)
+        self._rank = self._ranks.index(self._global_rank)
+
+        # Reuse the existing Megatron NCCL group; only create the Gloo cmd_group.
+        self._device_group = device_group
+        # self._device_group = _get_or_create_process_group(self._ranks, backend="nccl")
+
+        _pplx_debug_log(
+            f"Creating TorchProcessGroupAdapter cmd_group with device_group ranks {torch.distributed.get_process_group_ranks(self._device_group)} and node_meta {node_meta} and size {self._size}"
+        )
+        # new_group() requires ALL world ranks to call it collectively, even for subgroups
+        # they are not part of. Gather self._ranks from every world rank so that every rank
+        # creates Gloo groups for all partitions, not just its own.
+        world_size = torch.distributed.get_world_size()
+        all_ranks: list[list[int] | None] = [None] * world_size
+        torch.distributed.all_gather_object(all_ranks, self._ranks)
+        seen: set[tuple[int, ...]] = set()
+        for gathered_ranks in all_ranks:
+            key = tuple(gathered_ranks)
+            if key in seen:
+                continue
+            seen.add(key)
+            pg = _get_or_create_process_group(list(key), backend="gloo")
+            if gathered_ranks == self._ranks:
+                self._cmd_group = pg
+
+        assert hasattr(self, "_cmd_group"), (
+            f"Failed to find own ranks {self._ranks} in all_gather_object result"
+        )
+
+        # Wire up the reducer against the existing device group.
+        self._reducer = NcclAllReduce(group=self._device_group)
 
     @property
+    def is_inter_node(self) -> bool:
+        # Use actual node topology rather than TorchParallelGroup's size > 8 heuristic.
+        return self._is_inter_node
+    
+    @property
+    @override
     def device(self) -> torch.device:
         return self._device
 
     @property
+    @override
     def rank(self) -> int:
+        """Local index within the parallel group."""
         return self._rank
 
     @property
-    def global_rank(self) -> int:
-        return self._global_rank
-
-    @property
+    @override
     def node_rank(self) -> int:
+        """The rank of the node within the parallel group."""
         return self._node_rank
 
     @property
+    @override
+    def global_rank(self) -> int:
+        """Global index within the global group."""
+        return self._global_rank
+
+    @property
+    @override
     def local_rank(self) -> int:
+        """Local index within the current node."""
         return self._local_rank
 
     @property
+    @override
     def size(self) -> int:
+        """The size of the parallel group."""
         return self._size
 
     @property
+    @override
     def is_inter_node(self) -> bool:
-        return self._is_inter_node
+        """Returns true if the group spans multiple nodes."""
+        return self._size > 8
 
-    def all_gather_object(self, obj):
-        gathered = [None] * len(self._ranks)
-        torch.distributed.all_gather_object(gathered, obj, group=self._command_group)
-        return gathered
+    @override
+    @profile_range("reducer")
+    def reducer(
+        self,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        op: ReduceOp.RedOpType = ReduceOp.SUM,
+    ) -> Reducer:
+        return self._reducer.reducer(shape, dtype, op)
 
+    @override
+    @profile_range("all_reduce")
+    def all_reduce(
+        self,
+        x: torch.Tensor,
+        op: ReduceOp.RedOpType = ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._reducer.all_reduce(x, op)
+
+    @override
+    @profile_range("all_reduce_cpu_async")
+    def all_reduce_cpu_async(
+        self,
+        x: torch.Tensor,
+        op: ReduceOp.RedOpType = ReduceOp.SUM,
+    ) -> Work:
+        assert x.device.type == "cpu"
+        work = torch.distributed.all_reduce(
+            x,
+            op=op,
+            group=self._cmd_group,
+            async_op=True,
+        )
+        return cast(Work, work)
+
+    @override
+    @profile_range("all_gather")
+    def all_gather(self, x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        # Implementation adapted from vLLM
+        assert -x.dim() <= dim < x.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {x.size()}"
+        )
+        assert x.device == self._device
+
+        if dim < 0:
+            dim += x.dim()
+
+        input_size = x.size()
+        output_tensor = torch.empty(
+            (self._size,) + input_size,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        torch.distributed.all_gather_into_tensor(
+            output_tensor,
+            x,
+            group=self._device_group,
+        )
+
+        output_tensor = output_tensor.movedim(0, dim)
+        return output_tensor.reshape(
+            input_size[:dim] + (self._size * input_size[dim],) + input_size[dim + 1 :]
+        )
+
+    @override
+    def all_gather_object(self, obj: T) -> list[T]:
+        object_list = [None] * self._size
+        torch.distributed.all_gather_object(object_list, obj, group=self._cmd_group)
+        return cast(list[T], object_list)
+
+    @override
+    def broadcast_object(self, obj: T | None, root: int) -> T:
+        assert 0 <= root < self._size, (
+            f"Invalid rank {root} for group of size {self._size}"
+        )
+        objs = [obj]
+        torch.distributed.broadcast_object_list(
+            objs,
+            src=self._ranks[root],
+            group=self._cmd_group,
+        )
+        return cast(T, objs[0])
+
+    @override
+    def broadcast_cpu_tensor_async(self, tensor: torch.Tensor, root: int) -> Work:
+        assert tensor.device.type == "cpu"
+        work = torch.distributed.broadcast(
+            tensor,
+            src=self._ranks[root],
+            group=self._cmd_group,
+            async_op=True,
+        )
+        return cast(Work, work)
+
+    @override
+    def broadcast(self, tensor: torch.Tensor, root: int) -> torch.Tensor:
+        torch.distributed.broadcast(
+            tensor,
+            src=self._ranks[root],
+            group=self._device_group,
+        )
+        return tensor
+
+    @override
+    def all_to_all(self, tensor: torch.Tensor) -> torch.Tensor:
+        m, *_ = tensor.shape
+        if m != self._size:
+            msg = f"Expected leading dim {m} to match group size {self._size}"
+            raise ValueError(msg)
+
+        output = torch.empty_like(tensor)
+        torch.distributed.all_to_all_single(output, tensor, group=self._device_group)
+        return output
+
+    @override
     def barrier(self) -> None:
         torch.distributed.barrier(
-            group=self._device_group, device_ids=[self._device.index]
+            group=self._device_group,
+            device_ids=[self._device.index],
         )
+
+    @override
+    @contextmanager
+    def capture(self) -> Iterator[None]:
+        with self._reducer.capture():
+            yield
+
+    def destroy(self) -> None:
+        self._reducer.destroy()
+        _pplx_debug_log("Destroyed reducer")
+
+        # key = (tuple(self._ranks), "gloo")
+        # if _process_group_cache.pop(key, None) is not None:
+        #     torch.distributed.destroy_process_group(self._cmd_group)
+        #     _pplx_debug_log("Destroyed cmd_group")
+        
+        for pg_key, pg in list(_process_group_cache.items()):
+            if pg == self._cmd_group:
+                _pplx_debug_log(f"Destroying cmd_group with key {pg_key} and ranks {torch.distributed.get_process_group_ranks(pg)}")
+            if pg_key[1] == "gloo":
+                _pplx_debug_log(f"Destroying external cmd_groups with key {pg_key} and ranks {torch.distributed.get_process_group_ranks(pg)}")
+                torch.distributed.destroy_process_group(pg)
+                _process_group_cache.pop(pg_key)
+    
+        # NOTE: _device_group is owned by Megatron, do not destroy it here.
+
+    @override
+    def slice_by_count(self, slice_count: int) -> ParallelGroup:
+        assert self._size % slice_count == 0
+        slice_size = self._size // slice_count
+        return self.slice_by_lens([slice_size] * slice_count)
+
+    @override
+    def slice_by_lens(self, slice_lens: list[int]) -> ParallelGroup:
+        # new_group() requires all ranks to call it with the same ranks,
+        # even if the current rank is not in the subgroup.
+        # And this needs to happen in the same order.
+        # So we need to loop over all subgroups.
+
+        assert sum(slice_lens) == self._size
+        slice_ranks: list[list[int]] = []
+        cumsum = 0
+        for sl in slice_lens:
+            slice_ranks.append(self._ranks[cumsum : cumsum + sl])
+            cumsum += sl
+
+        ret: TorchParallelGroup | None = None
+        for ranks in slice_ranks:
+            if self._global_rank in ranks:
+                ret = TorchParallelGroup(
+                    self._device,
+                    self._node_rank,
+                    self._local_rank,
+                    self._global_rank,
+                    ranks,
+                )
+            else:
+                new_groups = self._create_new_groups(ranks)
+                assert new_groups is None
+        assert ret is not None
+
+        # A barrier on the new group is required
+        torch.distributed.barrier(
+            group=ret._device_group,
+            device_ids=[self._device.index],
+        )
+        return ret
+
+    def _slice_ranks(self, slice_rank: int, slice_count: int) -> list[int]:
+        """Slice the ranks assigned to this group."""
+
+        assert 0 < slice_count <= len(self._ranks)
+        assert 0 <= slice_rank < slice_count
+        assert len(self._ranks) % slice_count == 0
+        slice_size = len(self._ranks) // slice_count
+
+        return self._ranks[slice_rank * slice_size : (slice_rank + 1) * slice_size]
+
 
 
 def _build_node_rank_groups(ranks, gathered_rank_info):
@@ -172,7 +435,13 @@ def make_pplx_process_group_adapters(
     global_group: torch.distributed.ProcessGroup,
     dp_group: torch.distributed.ProcessGroup,
 ):
-    """Create pplx-garden adapters for the TPxEP global group and TP shared-token group."""
+    """Create pplx-garden adapters wrapping Megatron's flex global group and token-sharing group.
+
+    global_group is the flex global expert communication group (EPxETP, pg_collection.tp_ep).
+    dp_group is the ETP token-sharing subgroup where replicas live (pg_collection.expt_tp).
+    Both are passed in from Megatron's pg_collection; we do not re-create their NCCL groups.
+    Only Gloo cmd_groups and node-local subgroups are created here.
+    """
 
     if not HAVE_PPLX_GARDEN:
         raise ImportError(
@@ -183,49 +452,59 @@ def make_pplx_process_group_adapters(
     global_ranks, node_ranks, node_rank_groups, node_meta = _get_pplx_group_metadata(
         global_group
     )
-    dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+    # dp_ranks = torch.distributed.get_process_group_ranks(dp_group)
+    dp_ranks, node_ranks_dp, _, node_meta_dp = _get_pplx_group_metadata(dp_group)
+
+    _pplx_debug_log(
+        f"Constructed global_group_adapter with ranks {global_ranks} and node_meta {node_meta}"
+    )
+    _pplx_debug_log(
+        f"Constructed dp_group_adapter with ranks {dp_ranks} and node_meta {node_meta_dp}"
+    )
 
     global_group_adapter = _TorchProcessGroupAdapter(
         device_group=global_group,
-        command_group=_get_or_create_process_group(global_ranks, backend="gloo"),
         ranks=global_ranks,
         node_meta=node_meta,
     )
     dp_group_adapter = _TorchProcessGroupAdapter(
         device_group=dp_group,
-        command_group=_get_or_create_process_group(dp_ranks, backend="gloo"),
         ranks=dp_ranks,
-        node_meta=node_meta,
+        node_meta=node_meta_dp,
     )
 
-    node_group_adapter = None
-    if node_meta["num_nodes"] > 1:
-        node_device_group = None
-        node_command_group = None
-        current_rank = torch.distributed.get_rank()
-        for candidate_ranks in node_rank_groups:
-            candidate_device_group = _get_or_create_process_group(
-                candidate_ranks, backend="nccl"
-            )
-            candidate_command_group = _get_or_create_process_group(
-                candidate_ranks, backend="gloo"
-            )
-            if current_rank in candidate_ranks:
-                node_device_group = candidate_device_group
-                node_command_group = candidate_command_group
+    # NOTE: For EDP, the inner groups are ETP, EPP and PP, so ETP should always have a part be intranode (and also EP if no ETP)
+    # ep_is_inter_node = dp_group.size() >= gpus_per_node # EP pure internode
+    # if not ep_is_inter_node:
 
-        assert node_device_group is not None, (
-            "Failed to construct node-local pplx process group"
-        )
-        assert node_command_group is not None, (
-            "Failed to construct node-local pplx process group"
-        )
-        node_group_adapter = _TorchProcessGroupAdapter(
-            device_group=node_device_group,
-            command_group=node_command_group,
-            ranks=node_ranks,
-            node_meta=node_meta,
-        )
+    node_group_adapter = None
+    # if node_meta["num_nodes"] > 1:
+    #     node_device_group = None
+    #     current_rank = torch.distributed.get_rank()
+    #     for candidate_ranks in node_rank_groups:
+    #         # All ranks must participate in new_group; only keep ours.
+    #         candidate_device_group = _get_or_create_process_group(
+    #             candidate_ranks, backend="nccl"
+    #         )
+    #         if current_rank in candidate_ranks:
+    #             node_device_group = candidate_device_group
+
+    #     assert node_device_group is not None, (
+    #         "Failed to construct node-local pplx process group"
+    #     )
+    #     node_group_adapter = _TorchProcessGroupAdapter(
+    #         device_group=node_device_group,
+    #         ranks=node_ranks,
+    #         node_meta=node_meta,
+    #     )
+    # else:
+    #     # NOTE: because the slice goes in order the ranks should be in the same node
+    #     gpus_per_node = torch.cuda.device_count()
+    #     # TODO: How do we do this reliably?
+    #     assert 0 < gpus_per_node <= min(8, global_group.size(), 8)
+    #     node_group_adapter = global_group_adapter.slice_by_count(
+    #         global_group_adapter._size // gpus_per_node
+    #     )
 
     return global_group_adapter, dp_group_adapter, node_group_adapter
 
@@ -262,28 +541,68 @@ class PPLXDispatch(torch.autograd.Function):
             out_prob = torch.empty(
                 (max_recv_tokens,), dtype=torch.float32, device=x.device
             )
+
+        # NOTE: out_expert_x will be contiguous in order of tokens of expert 0, then tokens of expert 1, etc.
+        _pplx_debug_log(f"dispatch x before dispatch:\n{x[:, 0].tolist()}")
         kernel.dispatch(
             out_expert_num_tokens=out_num_tokens,
             out_expert_x=out_x,
             out_expert_x_scale=None,
-            dp_x=x.contiguous(),
+            dp_x=x,
             dp_x_scale=None,
-            indices=token_indices.contiguous(),
-            weights=dispatch_weights.contiguous(),
+            indices=token_indices,
+            weights=dispatch_weights,
             out_expert_prob=out_prob,
+            bound_m=None,
+            do_send=True,
+            do_recv=False,
         )
+        torch.cuda.synchronize()
+        kernel.dispatch(
+            out_expert_num_tokens=out_num_tokens,
+            out_expert_x=out_x,
+            out_expert_x_scale=None,
+            dp_x=x,
+            dp_x_scale=None,
+            indices=token_indices,
+            weights=dispatch_weights,
+            out_expert_prob=out_prob,
+            bound_m=None,
+            do_send=False,
+            do_recv=True,
+        )
+        torch.cuda.synchronize()
         num_recv_tokens = int(out_num_tokens.sum().item())
         _pplx_debug_log(
             "dispatch forward end "
-            f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()}"
+            f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()} out_x.shape={out_x.shape}"
         )
+        _pplx_debug_log(f"dispatch forward end out_x tokens:\n{out_x[:num_recv_tokens, 0].tolist()}")
+
+        # Debugging
+        tokens_mine_to_recv = (token_indices.reshape(-1).to(torch.int64) < num_local_experts).sum().item()
+        tokens_mine_to_recv_no_topk = (token_indices.to(torch.int64) < num_local_experts).any(dim=1).sum().item()
+        # recv_tokens_mine = 0
+        # if num_recv_tokens > 0 and x.shape[0] > 0:
+        #     x_first = x[:, 0].cpu()
+        #     out_x_first = out_x[:num_recv_tokens, 0].cpu()
+        #     for i in x_first.tolist():
+        #         for j in out_x_first.tolist():
+        #             if i == j:
+        #                 recv_tokens_mine += 1
+        _pplx_debug_log(f"tokens_mine_to_recv={tokens_mine_to_recv}")
+        _pplx_debug_log(f"tokens_mine_to_recv_no_topk={tokens_mine_to_recv_no_topk}")
+
         ctx.kernel = kernel
         ctx.num_input_tokens = x.shape[0]
         ctx.num_local_experts = num_local_experts
         ctx.save_for_backward(token_indices, torch.ones_like(dispatch_weights))
+        # if out_prob is None:
+        #     return out_x[:num_recv_tokens], out_num_tokens, None
+        # return out_x[:num_recv_tokens], out_num_tokens, out_prob[:num_recv_tokens]
         if out_prob is None:
-            return out_x[:num_recv_tokens], out_num_tokens, None
-        return out_x[:num_recv_tokens], out_num_tokens, out_prob[:num_recv_tokens]
+            return out_x, out_num_tokens, None
+        return out_x, out_num_tokens, out_prob
 
     @staticmethod
     def backward(ctx, grad_output, grad_num_tokens, grad_prob):
@@ -301,10 +620,12 @@ class PPLXDispatch(torch.autograd.Function):
         )
         ctx.kernel.combine(
             out_tokens=grad_x,
-            indices=token_indices.contiguous(),
-            weights=dispatch_weights.contiguous(),
-            expert_y=grad_output.contiguous(),
+            indices=token_indices,
+            weights=torch.ones_like(dispatch_weights), # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
+            expert_y=grad_output,
         )
+        torch.cuda.synchronize()
+    
         _pplx_debug_log("dispatch backward end")
         return grad_x, None, None, None, None, None, None
 
@@ -319,24 +640,55 @@ class PPLXCombine(torch.autograd.Function):
         _pplx_debug_log(
             "combine forward start "
             f"x_shape={tuple(x.shape)} x_dtype={x.dtype} x_stride={tuple(x.stride())} "
-            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} "
+            f"indices_shape={tuple(token_indices.shape)} indices_dtype={token_indices.dtype} indices={token_indices.tolist()} "
             f"weights_shape={tuple(combine_weights.shape)} weights_dtype={combine_weights.dtype} "
-            f"num_tokens={num_tokens} num_local_experts={num_local_experts}"
+            f"num_tokens={num_tokens} num_local_experts={num_local_experts} "
         )
         out_tokens = torch.empty(
             (num_tokens, x.shape[1]), dtype=x.dtype, device=x.device
         )
+        rank = torch.distributed.get_rank()
+
+        _pplx_debug_log(f"combine expert_y before combine:\n{x[:8, :8].tolist()}")
         kernel.combine(
             out_tokens=out_tokens,
-            indices=token_indices.contiguous(),
-            weights=combine_weights.contiguous(),
-            expert_y=x.contiguous(),
+            indices=token_indices,
+            weights=torch.ones_like(combine_weights), # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
+            expert_y=x,
+            accumulate=False, # NOTE: accumulate seems to be for when our out_tokens tensor already contains values and we want to add the expert results on top of it.
+            do_send=True,
+            do_recv=False,
         )
+        torch.cuda.synchronize()
+        recv_buf = kernel._recv_buffer_mapping.to_tensor(
+            (kernel._recv_buffer_mapping.size,), torch.uint8
+        ).cpu()
+        # view as the output dtype to see actual values
+        hidden_dim = kernel._hidden_dim
+        out_dtype = kernel._out_dtype
+        token_dim = ((hidden_dim * out_dtype.itemsize + 15) // 16) * 16
+        num_slots = kernel._recv_buffer_mapping.size // token_dim
+        data = recv_buf[:num_slots * token_dim].view(out_dtype).reshape(num_slots, -1)
+        _pplx_debug_log(f"combine recv buffer first 8 slots:\n{data[:8, :8].tolist()}")
+
+        kernel.combine(
+            out_tokens=out_tokens,
+            indices=token_indices,
+            weights=torch.ones_like(
+                combine_weights
+            ),  # NOTE: we need to pass ones here as the combine kernel always multiply the hidden states with the weights.
+            expert_y=x,
+            accumulate=False,  # NOTE: accumulate seems to be for when our out_tokens tensor already contains values and we want to add the expert results on top of it.
+            do_send=False,
+            do_recv=True,
+        )
+        torch.cuda.synchronize() 
+
         _pplx_debug_log("combine forward end")
         ctx.kernel = kernel
         ctx.num_local_experts = num_local_experts
         ctx.num_expert_tokens = x.shape[0]
-        ctx.save_for_backward(token_indices, combine_weights)
+        ctx.save_for_backward(token_indices, combine_weights) # NOTE: in reality we don't need the combine weights saved for the backward
         return out_tokens
 
     @staticmethod
@@ -358,17 +710,17 @@ class PPLXCombine(torch.autograd.Function):
             out_expert_num_tokens=out_num_tokens,
             out_expert_x=out_x,
             out_expert_x_scale=None,
-            dp_x=grad_output.contiguous(),
+            dp_x=grad_output,
             dp_x_scale=None,
-            indices=token_indices.contiguous(),
-            weights=combine_weights.contiguous(),
+            indices=token_indices,
+            weights=combine_weights, # NOTE: it will not be dispatched as we aren't allocating for the out_expert_probs
         )
         num_recv_tokens = int(out_num_tokens.sum().item())
         _pplx_debug_log(
             "combine backward end "
             f"num_recv_tokens={num_recv_tokens} tokens_per_expert={out_num_tokens.tolist()}"
         )
-        return out_x[:num_recv_tokens], None, None, None, None, None
+        return out_x, None, None, None, None, None
 
 
 if HAVE_PPLX_GARDEN:
